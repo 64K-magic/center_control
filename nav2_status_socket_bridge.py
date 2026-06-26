@@ -210,7 +210,7 @@ class Nav2StatusSocketBridge(Node):
         self.declare_parameter('status_topic', '/nav2/status')
         self.declare_parameter('socket_mode', 'server')  # server | client
         self.declare_parameter('socket_host', '0.0.0.0')
-        self.declare_parameter('socket_port', 9090)
+        self.declare_parameter('socket_port', 9091)
         self.declare_parameter('ws_path', '/nav2/status')
         self.declare_parameter('reconnect_interval_sec', 2.0)
         self.declare_parameter('obstacle_alert_enabled', True)
