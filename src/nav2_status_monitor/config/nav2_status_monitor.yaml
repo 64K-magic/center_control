@@ -1,0 +1,18 @@
+nav2_status_monitor:
+  ros__parameters:
+    status_topic: /nav2/status
+    publish_period_sec: 2.0
+    navigate_to_pose_status_topic: /navigate_to_pose/_action/status
+    navigate_to_pose_feedback_topic: /navigate_to_pose/_action/feedback
+    navigate_through_poses_status_topic: /navigate_through_poses/_action/status
+    navigate_through_poses_feedback_topic: /navigate_through_poses/_action/feedback
+    follow_waypoints_status_topic: /follow_waypoints/_action/status
+    follow_waypoints_feedback_topic: /follow_waypoints/_action/feedback
+    behavior_tree_log_topic: /behavior_tree_log
+    nav2_availability_topic: /navigate_to_pose/_action/status
+    # 前方激光遮挡提前预警（早于 FollowPath 失败）
+    early_obstacle_detection: true
+    scan_topic: /scan
+    obstacle_ahead_distance: 2.5
+    obstacle_ahead_clear_distance: 3.5
+    obstacle_ahead_half_angle_deg: 30.0
