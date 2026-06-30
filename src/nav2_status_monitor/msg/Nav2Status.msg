@@ -25,4 +25,7 @@ uint16 recovery_count
 string failure_category
 string failure_detail
 string failed_bt_node
+# 激光障碍与 FollowPath 失败独立标记（可同时为 true；failure_detail 仍为最近一次主失败）
+bool obstacle_ahead_active
+bool follow_path_failed_active
 string[] active_behaviors

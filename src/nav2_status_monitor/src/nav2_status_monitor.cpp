@@ -58,6 +58,8 @@ public:
     declare_parameter<double>("obstacle_ahead_distance", 2.5);
     declare_parameter<double>("obstacle_ahead_clear_distance", 3.5);
     declare_parameter<double>("obstacle_ahead_half_angle_deg", 35.0);
+    declare_parameter<int>("obstacle_ahead_confirm_scans", 40);
+    declare_parameter<int>("obstacle_ahead_clear_confirm_scans", 2);
 
     const auto status_topic = get_parameter("status_topic").as_string();
     publish_period_sec_ = get_parameter("publish_period_sec").as_double();
@@ -67,6 +69,10 @@ public:
     obstacle_ahead_clear_distance_ = get_parameter("obstacle_ahead_clear_distance").as_double();
     obstacle_ahead_half_angle_rad_ =
       get_parameter("obstacle_ahead_half_angle_deg").as_double() * M_PI / 180.0;
+    obstacle_ahead_confirm_scans_ =
+      std::max(1, static_cast<int>(get_parameter("obstacle_ahead_confirm_scans").as_int()));
+    obstacle_ahead_clear_confirm_scans_ =
+      std::max(1, static_cast<int>(get_parameter("obstacle_ahead_clear_confirm_scans").as_int()));
 
     status_pub_ = create_publisher<Nav2StatusMsg>(status_topic, 10);
 
@@ -158,10 +164,13 @@ public:
     if (early_obstacle_detection_) {
       RCLCPP_INFO(
         get_logger(),
-        "Early obstacle detection enabled on %s (%.1fm ahead, %.1f deg half-angle)",
+        "Early obstacle detection enabled on %s (%.1fm ahead, %.1fm clear, %.1f deg half-angle, confirm=%d clear_confirm=%d)",
         get_parameter("scan_topic").as_string().c_str(),
         obstacle_ahead_distance_,
-        obstacle_ahead_half_angle_rad_ * 180.0 / M_PI);
+        obstacle_ahead_clear_distance_,
+        obstacle_ahead_half_angle_rad_ * 180.0 / M_PI,
+        obstacle_ahead_confirm_scans_,
+        obstacle_ahead_clear_confirm_scans_);
     }
 
     publishStatus(true);
@@ -248,38 +257,99 @@ private:
     if (!isNavigationActive()) {
       return;
     }
-    if (last_failure_detail_ == "follow_path_failed") {
+
+    const bool was_active = obstacle_ahead_active_;
+    obstacle_ahead_active_ = true;
+    const bool failure_changed = !follow_path_failed_active_ && (
+      last_failure_category_ != "control" ||
+      last_failure_detail_ != "obstacle_ahead" ||
+      last_failed_bt_node_ != "LaserScan");
+    if (!follow_path_failed_active_) {
+      last_failure_category_ = "control";
+      last_failure_detail_ = "obstacle_ahead";
+      last_failed_bt_node_ = "LaserScan";
+    }
+    if (!was_active || failure_changed) {
+      publishStatus();
+    }
+  }
+
+  void clearObstacleAheadOnly()
+  {
+    if (!obstacle_ahead_active_) {
       return;
     }
 
-    const bool changed = last_failure_category_ != "control" ||
-      last_failure_detail_ != "obstacle_ahead" ||
-      last_failed_bt_node_ != "LaserScan";
-    last_failure_category_ = "control";
-    last_failure_detail_ = "obstacle_ahead";
-    last_failed_bt_node_ = "LaserScan";
-    if (changed) {
+    obstacle_ahead_active_ = false;
+    blocked_scan_count_ = 0;
+    clear_scan_count_ = 0;
+    if (follow_path_failed_active_ || in_recovery_) {
+      publishStatus();
+      return;
+    }
+
+    if (last_failure_detail_ == "obstacle_ahead") {
+      resetFailureTracking();
       publishStatus();
     }
   }
 
   void clearObstacleAheadIfPathOpen(double min_forward_range)
   {
-    if (last_failure_detail_ != "obstacle_ahead") {
+    if (!obstacle_ahead_active_) {
       return;
     }
     if (min_forward_range <= obstacle_ahead_clear_distance_) {
       return;
     }
-    if (in_recovery_) {
+    clearObstacleAheadOnly();
+  }
+
+  void handleFollowPathSuccess()
+  {
+    if (!follow_path_failed_active_) {
       return;
     }
-    clearFailureAndRecovery();
+
+    follow_path_failed_active_ = false;
+    if (obstacle_ahead_active_) {
+      last_failure_category_ = "control";
+      last_failure_detail_ = "obstacle_ahead";
+      last_failed_bt_node_ = "LaserScan";
+    } else if (last_failure_detail_ == "follow_path_failed") {
+      if (in_recovery_) {
+        last_failure_category_ = "control";
+        last_failure_detail_ = "control_recovery";
+        last_failed_bt_node_ = "FollowPath";
+      } else {
+        last_failure_category_ = "unknown";
+        last_failure_detail_ = "unknown";
+        last_failed_bt_node_.clear();
+      }
+    }
+    publishStatus();
   }
 
   void scanCb(const sensor_msgs::msg::LaserScan::SharedPtr msg)
   {
-    if (!ensureNav2AvailableForUpdate() || !isNavigationActive()) {
+    if (!ensureNav2AvailableForUpdate()) {
+      return;
+    }
+
+    if (!isNavigationActive()) {
+      if (obstacle_ahead_active_) {
+        blocked_scan_count_ = 0;
+        clear_scan_count_ = 0;
+        obstacle_ahead_active_ = false;
+        if (!follow_path_failed_active_ && !in_recovery_) {
+          if (last_failure_detail_ == "obstacle_ahead") {
+            resetFailureTracking();
+            publishStatus();
+          }
+        } else {
+          publishStatus();
+        }
+      }
       return;
     }
 
@@ -302,11 +372,25 @@ private:
     }
 
     if (min_forward_range <= obstacle_ahead_distance_) {
-      setObstacleAheadFailure();
+      blocked_scan_count_++;
+      clear_scan_count_ = 0;
+      if (blocked_scan_count_ >= obstacle_ahead_confirm_scans_) {
+        setObstacleAheadFailure();
+      }
       return;
     }
 
-    clearObstacleAheadIfPathOpen(min_forward_range);
+    // 滞回区 (distance, clear_distance)：不清零计数，避免边界抖动
+    if (min_forward_range <= obstacle_ahead_clear_distance_) {
+      clear_scan_count_ = 0;
+      return;
+    }
+
+    clear_scan_count_++;
+    if (clear_scan_count_ >= obstacle_ahead_clear_confirm_scans_) {
+      blocked_scan_count_ = 0;
+      clearObstacleAheadIfPathOpen(min_forward_range);
+    }
   }
 
   Nav2StatusMsg makeStatusMsg() const
@@ -324,6 +408,8 @@ private:
     msg.failure_category = last_failure_category_;
     msg.failure_detail = last_failure_detail_;
     msg.failed_bt_node = last_failed_bt_node_;
+    msg.obstacle_ahead_active = obstacle_ahead_active_;
+    msg.follow_path_failed_active = follow_path_failed_active_;
     msg.active_behaviors.assign(active_behaviors_.begin(), active_behaviors_.end());
     return msg;
   }
@@ -342,6 +428,8 @@ private:
            msg.failure_category != last_published_.failure_category ||
            msg.failure_detail != last_published_.failure_detail ||
            msg.failed_bt_node != last_published_.failed_bt_node ||
+           msg.obstacle_ahead_active != last_published_.obstacle_ahead_active ||
+           msg.follow_path_failed_active != last_published_.follow_path_failed_active ||
            msg.active_behaviors != last_published_.active_behaviors;
   }
 
@@ -627,6 +715,10 @@ private:
   void resetFailureTracking()
   {
     bt_failures_.clear();
+    obstacle_ahead_active_ = false;
+    follow_path_failed_active_ = false;
+    blocked_scan_count_ = 0;
+    clear_scan_count_ = 0;
     last_failure_category_ = "unknown";
     last_failure_detail_ = "unknown";
     last_failed_bt_node_.clear();
@@ -704,6 +796,11 @@ private:
     }
 
     for (const auto & event : msg->event_log) {
+      if (kControlNodes.count(event.node_name) > 0 && event.current_status == "SUCCESS") {
+        handleFollowPathSuccess();
+        continue;
+      }
+
       if (event.current_status != "FAILURE") {
         continue;
       }
@@ -716,12 +813,14 @@ private:
       const std::string previous_category = last_failure_category_;
       const std::string previous_detail = last_failure_detail_;
       const std::string previous_node = last_failed_bt_node_;
+      const bool previous_follow_path_active = follow_path_failed_active_;
 
       if (kPlanningNodes.count(event.node_name) > 0) {
         last_failure_category_ = "planning";
         last_failure_detail_ = "no_path_to_goal";
         last_failed_bt_node_ = event.node_name;
       } else if (kControlNodes.count(event.node_name) > 0) {
+        follow_path_failed_active_ = true;
         last_failure_category_ = "control";
         last_failure_detail_ = "follow_path_failed";
         last_failed_bt_node_ = event.node_name;
@@ -741,7 +840,8 @@ private:
 
       if (last_failure_category_ != previous_category ||
         last_failure_detail_ != previous_detail ||
-        last_failed_bt_node_ != previous_node)
+        last_failed_bt_node_ != previous_node ||
+        follow_path_failed_active_ != previous_follow_path_active)
       {
         publishStatus();
       }
@@ -773,6 +873,9 @@ private:
     last_failure_category_ = category;
     last_failure_detail_ = detail;
     last_failed_bt_node_ = bt_node;
+    if (detail == "follow_path_failed") {
+      follow_path_failed_active_ = true;
+    }
 
     publishStatus();
   }
@@ -855,6 +958,10 @@ private:
   double obstacle_ahead_distance_{2.5};
   double obstacle_ahead_clear_distance_{3.5};
   double obstacle_ahead_half_angle_rad_{0.61};
+  int obstacle_ahead_confirm_scans_{20};
+  int obstacle_ahead_clear_confirm_scans_{2};
+  int blocked_scan_count_{0};
+  int clear_scan_count_{0};
 
   bool nav2_available_{false};
   std::unordered_map<std::string, int8_t> task_states_;
@@ -874,6 +981,8 @@ private:
   std::string last_failure_category_{"unknown"};
   std::string last_failure_detail_{"unknown"};
   std::string last_failed_bt_node_;
+  bool obstacle_ahead_active_{false};
+  bool follow_path_failed_active_{false};
 
   Nav2StatusMsg last_published_;
 };
