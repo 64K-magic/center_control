@@ -60,6 +60,8 @@ public:
     declare_parameter<double>("obstacle_ahead_half_angle_deg", 35.0);
     declare_parameter<int>("obstacle_ahead_confirm_scans", 40);
     declare_parameter<int>("obstacle_ahead_clear_confirm_scans", 2);
+    declare_parameter<int>("obstacle_ahead_min_points", 8);
+    declare_parameter<std::string>("obstacle_scan_topic", "/obstacle/scan");
 
     const auto status_topic = get_parameter("status_topic").as_string();
     publish_period_sec_ = get_parameter("publish_period_sec").as_double();
@@ -73,6 +75,8 @@ public:
       std::max(1, static_cast<int>(get_parameter("obstacle_ahead_confirm_scans").as_int()));
     obstacle_ahead_clear_confirm_scans_ =
       std::max(1, static_cast<int>(get_parameter("obstacle_ahead_clear_confirm_scans").as_int()));
+    obstacle_ahead_min_points_ =
+      std::max(1, static_cast<int>(get_parameter("obstacle_ahead_min_points").as_int()));
 
     status_pub_ = create_publisher<Nav2StatusMsg>(status_topic, 10);
 
@@ -137,6 +141,9 @@ public:
     }
 
     if (early_obstacle_detection_) {
+      const auto obstacle_scan_topic = get_parameter("obstacle_scan_topic").as_string();
+      obstacle_scan_pub_ = create_publisher<sensor_msgs::msg::LaserScan>(
+        obstacle_scan_topic, rclcpp::SensorDataQoS());
       scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
         get_parameter("scan_topic").as_string(),
         rclcpp::SensorDataQoS(),
@@ -164,13 +171,18 @@ public:
     if (early_obstacle_detection_) {
       RCLCPP_INFO(
         get_logger(),
-        "Early obstacle detection enabled on %s (%.1fm ahead, %.1fm clear, %.1f deg half-angle, confirm=%d clear_confirm=%d)",
+        "Early obstacle detection enabled on %s (%.1fm ahead, %.1fm clear, %.1f deg half-angle, confirm=%d clear_confirm=%d min_points=%d)",
         get_parameter("scan_topic").as_string().c_str(),
         obstacle_ahead_distance_,
         obstacle_ahead_clear_distance_,
         obstacle_ahead_half_angle_rad_ * 180.0 / M_PI,
         obstacle_ahead_confirm_scans_,
-        obstacle_ahead_clear_confirm_scans_);
+        obstacle_ahead_clear_confirm_scans_,
+        obstacle_ahead_min_points_);
+      RCLCPP_INFO(
+        get_logger(),
+        "Obstacle scan publisher: %s",
+        get_parameter("obstacle_scan_topic").as_string().c_str());
     }
 
     publishStatus(true);
@@ -305,6 +317,87 @@ private:
     clearObstacleAheadOnly();
   }
 
+  struct ForwardSectorStats
+  {
+    double min_range{std::numeric_limits<double>::infinity()};
+    int close_points{0};
+    int near_points{0};
+  };
+
+  ForwardSectorStats analyzeForwardSector(const sensor_msgs::msg::LaserScan & msg) const
+  {
+    ForwardSectorStats stats;
+    for (size_t i = 0; i < msg.ranges.size(); ++i) {
+      const double angle = msg.angle_min + static_cast<double>(i) * msg.angle_increment;
+      if (std::abs(angle) > obstacle_ahead_half_angle_rad_) {
+        continue;
+      }
+
+      const double range = static_cast<double>(msg.ranges[i]);
+      if (!std::isfinite(range) || range < msg.range_min || range > msg.range_max) {
+        continue;
+      }
+
+      stats.min_range = std::min(stats.min_range, range);
+      if (range <= obstacle_ahead_distance_) {
+        stats.close_points++;
+      }
+      if (range <= obstacle_ahead_clear_distance_) {
+        stats.near_points++;
+      }
+    }
+    return stats;
+  }
+
+  bool hasSolidForwardObstacle(const ForwardSectorStats & stats) const
+  {
+    return stats.close_points >= obstacle_ahead_min_points_ &&
+           stats.min_range <= obstacle_ahead_distance_;
+  }
+
+  bool inForwardObstacleZone(const ForwardSectorStats & stats) const
+  {
+    return stats.near_points >= obstacle_ahead_min_points_ &&
+           stats.min_range <= obstacle_ahead_clear_distance_;
+  }
+
+  sensor_msgs::msg::LaserScan buildObstacleScan(
+    const sensor_msgs::msg::LaserScan & src,
+    const ForwardSectorStats & stats) const
+  {
+    sensor_msgs::msg::LaserScan out = src;
+    const bool publish_hits = hasSolidForwardObstacle(stats) || inForwardObstacleZone(stats);
+    for (size_t i = 0; i < out.ranges.size(); ++i) {
+      out.ranges[i] = std::numeric_limits<float>::infinity();
+      if (!publish_hits) {
+        continue;
+      }
+      const double angle = out.angle_min + static_cast<double>(i) * out.angle_increment;
+      const double range = static_cast<double>(src.ranges[i]);
+      const bool in_sector = std::abs(angle) <= obstacle_ahead_half_angle_rad_;
+      const bool valid = std::isfinite(range) &&
+        range >= static_cast<double>(out.range_min) &&
+        range <= static_cast<double>(out.range_max);
+      const bool in_distance = valid && range <= obstacle_ahead_clear_distance_;
+      if (in_sector && in_distance) {
+        out.ranges[i] = src.ranges[i];
+      }
+    }
+    return out;
+  }
+
+  void publishObstacleScan(
+    const sensor_msgs::msg::LaserScan & src,
+    const ForwardSectorStats & stats)
+  {
+    if (!obstacle_scan_pub_) {
+      return;
+    }
+    auto out = buildObstacleScan(src, stats);
+    out.header.stamp = get_clock()->now();
+    obstacle_scan_pub_->publish(out);
+  }
+
   void handleFollowPathSuccess()
   {
     if (!follow_path_failed_active_) {
@@ -353,43 +446,34 @@ private:
       return;
     }
 
-    double min_forward_range = std::numeric_limits<double>::infinity();
-    for (size_t i = 0; i < msg->ranges.size(); ++i) {
-      const double angle = msg->angle_min + static_cast<double>(i) * msg->angle_increment;
-      if (std::abs(angle) > obstacle_ahead_half_angle_rad_) {
-        continue;
-      }
-
-      const double range = static_cast<double>(msg->ranges[i]);
-      if (!std::isfinite(range) || range < msg->range_min || range > msg->range_max) {
-        continue;
-      }
-      min_forward_range = std::min(min_forward_range, range);
-    }
-
-    if (!std::isfinite(min_forward_range)) {
+    const ForwardSectorStats sector = analyzeForwardSector(*msg);
+    if (!std::isfinite(sector.min_range)) {
       return;
     }
 
-    if (min_forward_range <= obstacle_ahead_distance_) {
+    if (hasSolidForwardObstacle(sector)) {
       blocked_scan_count_++;
       clear_scan_count_ = 0;
       if (blocked_scan_count_ >= obstacle_ahead_confirm_scans_) {
         setObstacleAheadFailure();
       }
+      if (obstacle_ahead_active_) {
+        publishObstacleScan(*msg, sector);
+      }
       return;
     }
 
-    // 滞回区 (distance, clear_distance)：不清零计数，避免边界抖动
-    if (min_forward_range <= obstacle_ahead_clear_distance_) {
+    // 滞回区：点数仍足够才维持；孤立残点（绕过障碍后的噪点/反射）不计入
+    if (obstacle_ahead_active_ && inForwardObstacleZone(sector)) {
       clear_scan_count_ = 0;
+      publishObstacleScan(*msg, sector);
       return;
     }
 
+    blocked_scan_count_ = 0;
     clear_scan_count_++;
     if (clear_scan_count_ >= obstacle_ahead_clear_confirm_scans_) {
-      blocked_scan_count_ = 0;
-      clearObstacleAheadIfPathOpen(min_forward_range);
+      clearObstacleAheadIfPathOpen(sector.min_range);
     }
   }
 
@@ -939,6 +1023,7 @@ private:
   }
 
   rclcpp::Publisher<Nav2StatusMsg>::SharedPtr status_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr obstacle_scan_pub_;
   rclcpp::TimerBase::SharedPtr summary_timer_;
 
   rclcpp::Subscription<action_msgs::msg::GoalStatusArray>::SharedPtr navigate_to_pose_status_sub_;
@@ -960,6 +1045,7 @@ private:
   double obstacle_ahead_half_angle_rad_{0.61};
   int obstacle_ahead_confirm_scans_{20};
   int obstacle_ahead_clear_confirm_scans_{2};
+  int obstacle_ahead_min_points_{8};
   int blocked_scan_count_{0};
   int clear_scan_count_{0};
 

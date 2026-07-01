@@ -8,9 +8,10 @@ Nav2 status WebSocket bridge with RTK monitoring and obstacle alert.
   - 订阅 /odometry/gps，计算实时话题频率
   - obstacle_ahead（激光）与 follow_path_failed（recovery/卡住）分字段、分通道处理
 
-运行方式:
-  python3 nav2_status_socket_bridge.py
-  python3 nav2_status_socket_bridge.py --gps-monitor   # 仅 RTK 日志模式
+运行方式（须先 source 工作空间，否则无法 import nav2_status_monitor）:
+  cd ~/jfby_ws && source install/setup.bash
+  python3 src/nav2_status_socket_bridge.py
+  python3 src/nav2_status_socket_bridge.py --gps-monitor   # 仅 RTK 日志模式
 """
 
 import argparse
@@ -20,19 +21,81 @@ import math
 import subprocess
 import threading
 from collections import deque
+from datetime import datetime
 from pathlib import Path
-from typing import Set
+from typing import Callable, Set
 
 import rclpy
 import websockets
-from nav2_status_monitor.msg import Nav2Status
+
+try:
+    from nav2_status_monitor.msg import Nav2Status
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        '无法 import nav2_status_monitor：请先编译并 source 工作空间。\n'
+        '  cd ~/jfby_ws\n'
+        '  colcon build --packages-select nav2_status_monitor\n'
+        '  source install/setup.bash\n'
+        '  python3 -c "from nav2_status_monitor.msg import Nav2Status"  # 验证\n'
+        '  python3 src/nav2_status_socket_bridge.py\n'
+        '若仍失败，检查 python3 版本是否与 install/.../python3.X 一致。'
+    ) from exc
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from sensor_msgs.msg import NavSatFix
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import LaserScan, NavSatFix
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.asyncio.server import ServerConnection, serve
 
 DEFAULT_OBSTACLE_WAV = Path(__file__).resolve().parent / 'alarm' / 'obstacle.wav'
+DEFAULT_OBSTACLE_SCAN_IMAGE_DIR = Path(__file__).resolve().parent / 'logs' / 'obstacle_scans'
+
+
+def play_time_to_image_path(play_at: float, output_dir: Path, suffix: int = 0) -> Path:
+    """Filename from voice play time: YYYYMMDD_HHMMSS_mmm.png (optional _N suffix)."""
+    dt = datetime.fromtimestamp(play_at)
+    name = dt.strftime('%Y%m%d_%H%M%S') + '_%03d' % int((play_at % 1.0) * 1000)
+    if suffix > 0:
+        name += '_%d' % suffix
+    return output_dir / (name + '.png')
+
+
+def save_obstacle_scan_xy(scan: LaserScan, out_path: Path) -> bool:
+    """Save /obstacle/scan XY projection PNG (same style as save_scan_xy.py)."""
+    try:
+        import numpy as np
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return False
+
+    ranges = np.array(scan.ranges, dtype=np.float64)
+    angles = scan.angle_min + np.arange(len(ranges), dtype=np.float64) * scan.angle_increment
+    valid = np.isfinite(ranges) & (ranges > scan.range_min) & (ranges < scan.range_max)
+    if not np.any(valid):
+        return False
+
+    r = ranges[valid]
+    a = angles[valid]
+    x = r * np.cos(a)
+    y = r * np.sin(a)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.scatter(x, y, s=8, c='orangered', alpha=0.8, label='obstacle hits')
+    ax.scatter(0, 0, s=100, c='red', marker='o', label='robot center')
+    ax.set_xlabel('x (m) - forward')
+    ax.set_ylabel('y (m) - left')
+    ax.set_title('/obstacle/scan XY projection')
+    ax.set_aspect('equal')
+    ax.grid(True)
+    ax.legend()
+    ax.set_xlim(-5, 10)
+    ax.set_ylim(-5, 5)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return True
 
 
 # ==================== RTK 稳定性检测 ====================
@@ -242,7 +305,11 @@ class Nav2StatusSocketBridge(Node):
         self.declare_parameter('obstacle_alert_repeat_interval_sec', 10.0)
         self.declare_parameter('obstacle_long_episode_play_sec', 10.0)
         self.declare_parameter('obstacle_voice_clear_grace_sec', 3.0)
+        self.declare_parameter('obstacle_recovery_clear_grace_sec', 10.0)
         self.declare_parameter('follow_path_failed_alert_enabled', False)
+        self.declare_parameter('obstacle_scan_topic', '/obstacle/scan')
+        self.declare_parameter('obstacle_scan_image_enabled', True)
+        self.declare_parameter('obstacle_scan_image_dir', str(DEFAULT_OBSTACLE_SCAN_IMAGE_DIR))
         self.declare_parameter('rtk_log_period_sec', 10.0)
         self.declare_parameter('odometry_gps_topic', '/odometry/gps')
         self.declare_parameter('gps_hz_window_seconds', 2.0)
@@ -289,9 +356,22 @@ class Nav2StatusSocketBridge(Node):
         self._obstacle_voice_clear_grace_sec = (
             self.get_parameter('obstacle_voice_clear_grace_sec').get_parameter_value().double_value
         )
+        self._obstacle_recovery_clear_grace_sec = (
+            self.get_parameter('obstacle_recovery_clear_grace_sec').get_parameter_value().double_value
+        )
         self._follow_path_failed_alert_enabled = (
             self.get_parameter('follow_path_failed_alert_enabled').get_parameter_value().bool_value
         )
+        self._obstacle_scan_topic = (
+            self.get_parameter('obstacle_scan_topic').get_parameter_value().string_value
+        )
+        self._obstacle_scan_image_enabled = (
+            self.get_parameter('obstacle_scan_image_enabled').get_parameter_value().bool_value
+        )
+        self._obstacle_scan_image_dir = Path(
+            self.get_parameter('obstacle_scan_image_dir').get_parameter_value().string_value
+        )
+        self._latest_obstacle_scan: LaserScan | None = None
         # 激光障碍预警（obstacle_ahead）
         self._laser_since: float | None = None
         self._laser_last_play_at: float | None = None
@@ -323,6 +403,13 @@ class Nav2StatusSocketBridge(Node):
         self.create_subscription(Nav2Status, status_topic, self._status_callback, 10)
         self.create_subscription(NavSatFix, gps_topic, self._gps_callback, 10)
         self.create_subscription(Odometry, odometry_gps_topic, self._odometry_gps_callback, 10)
+        if self._obstacle_scan_image_enabled:
+            self.create_subscription(
+                LaserScan,
+                self._obstacle_scan_topic,
+                self._obstacle_scan_callback,
+                qos_profile_sensor_data,
+            )
 
         rtk_log_period = self.get_parameter('rtk_log_period_sec').get_parameter_value().double_value
         if rtk_log_period > 0.0:
@@ -349,6 +436,11 @@ class Nav2StatusSocketBridge(Node):
                 'FollowPath recovery voice: enabled=%s'
                 % self._follow_path_failed_alert_enabled
             )
+            if self._obstacle_scan_image_enabled:
+                self.get_logger().info(
+                    'Obstacle scan images: topic=%s dir=%s'
+                    % (self._obstacle_scan_topic, self._obstacle_scan_image_dir)
+                )
 
     def _ws_url(self) -> str:
         return f'ws://{self._host}:{self._port}{self._ws_path}'
@@ -525,7 +617,23 @@ class Nav2StatusSocketBridge(Node):
         return msg.task_status == 'executing'
 
     def _is_laser_obstacle_voice_active(self, msg: Nav2Status) -> bool:
-        return self._is_navigation_executing(msg) and msg.obstacle_ahead_active
+        if not self._is_navigation_executing(msg):
+            return False
+        if msg.obstacle_ahead_active:
+            return True
+        # recovery 倒车/旋转时激光可能短暂无障碍；FollowPath 已失败则保持 episode 续播
+        if (
+            msg.in_recovery
+            and msg.follow_path_failed_active
+            and self._laser_since is not None
+        ):
+            return True
+        return False
+
+    def _laser_voice_clear_grace_sec(self, msg: Nav2Status) -> float:
+        if msg.in_recovery and msg.follow_path_failed_active:
+            return self._obstacle_recovery_clear_grace_sec
+        return self._obstacle_voice_clear_grace_sec
 
     def _is_follow_path_recovery_voice_active(self, msg: Nav2Status) -> bool:
         if not self._follow_path_failed_alert_enabled:
@@ -545,6 +653,7 @@ class Nav2StatusSocketBridge(Node):
         wav = str(wav_path)
 
         def play() -> None:
+            last_error = ''
             try:
                 for player in ('aplay', 'paplay'):
                     try:
@@ -552,25 +661,68 @@ class Nav2StatusSocketBridge(Node):
                             [player, '-q', wav],
                             check=True,
                             stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            text=True,
                         )
-                        break
-                    except (FileNotFoundError, subprocess.CalledProcessError):
+                        return
+                    except FileNotFoundError:
+                        last_error = '%s: not found in PATH' % player
                         continue
-                else:
-                    self.get_logger().warning('No audio player available (aplay/paplay)')
+                    except subprocess.CalledProcessError as exc:
+                        detail = (exc.stderr or '').strip() or 'exit %d' % exc.returncode
+                        last_error = '%s failed: %s' % (player, detail)
+                        continue
+                self.get_logger().warning(
+                    'No audio player available (aplay/paplay). Last error: %s' % last_error
+                )
             finally:
                 with self._lock:
                     self._alert_audio_playing = False
 
         threading.Thread(target=play, daemon=True).start()
 
-    def _play_laser_obstacle_alert(self) -> None:
+    def _obstacle_scan_callback(self, msg: LaserScan) -> None:
+        with self._lock:
+            self._latest_obstacle_scan = msg
+
+    def _save_obstacle_scan_image(self, play_at: float) -> None:
+        if not self._obstacle_scan_image_enabled:
+            return
+
+        with self._lock:
+            scan = self._latest_obstacle_scan
+
+        if scan is None:
+            self.get_logger().warning(
+                'No %s message cached; skip obstacle scan image' % self._obstacle_scan_topic
+            )
+            return
+
+        out_path = play_time_to_image_path(play_at, self._obstacle_scan_image_dir)
+        suffix = 0
+        while out_path.exists() and suffix < 99:
+            suffix += 1
+            out_path = play_time_to_image_path(play_at, self._obstacle_scan_image_dir, suffix)
+        scan_copy = scan
+
+        def save() -> None:
+            if save_obstacle_scan_xy(scan_copy, out_path):
+                self.get_logger().info('Saved obstacle scan image: %s' % out_path)
+            else:
+                self.get_logger().warning(
+                    'Failed to save obstacle scan image (need numpy/matplotlib): %s'
+                    % out_path
+                )
+
+        threading.Thread(target=save, daemon=True).start()
+
+    def _play_laser_obstacle_alert(self, play_at: float) -> None:
         if not self._obstacle_alert_enabled:
             return
+        self._save_obstacle_scan_image(play_at)
         self._play_alert_wav(self._obstacle_wav_path, 'Laser obstacle')
 
-    def _play_follow_path_recovery_alert(self) -> None:
+    def _play_follow_path_recovery_alert(self, play_at: float) -> None:
         if not self._obstacle_alert_enabled:
             return
         self._play_alert_wav(self._obstacle_wav_path, 'FollowPath recovery')
@@ -622,7 +774,7 @@ class Nav2StatusSocketBridge(Node):
         repeat_hold_sec: float,
         repeat_interval_sec: float,
         long_episode_sec: float,
-        play_callback,
+        play_callback: Callable[[float], None],
         log_label: str,
     ) -> tuple[float | None, float | None, int, float | None]:
         if active:
@@ -644,7 +796,7 @@ class Nav2StatusSocketBridge(Node):
                     'Playing %s alert (#%d, episode=%.1fs)'
                     % (log_label, play_count + 1, now - since)
                 )
-                play_callback()
+                play_callback(now)
                 last_play_at = now
                 play_count += 1
             return since, last_play_at, play_count, None
@@ -670,7 +822,7 @@ class Nav2StatusSocketBridge(Node):
                 last_play_at=self._laser_last_play_at,
                 play_count=self._laser_play_count,
                 clear_since=self._laser_clear_since,
-                grace_sec=self._obstacle_voice_clear_grace_sec,
+                grace_sec=self._laser_voice_clear_grace_sec(msg),
                 repeat_hold_sec=self._obstacle_ahead_repeat_hold_sec,
                 repeat_interval_sec=self._obstacle_alert_repeat_interval_sec,
                 long_episode_sec=self._obstacle_long_episode_play_sec,

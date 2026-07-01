@@ -15,7 +15,10 @@ nav2_status_monitor:
     scan_topic: /scan
     obstacle_ahead_distance: 3.0
     obstacle_ahead_clear_distance: 3.5
-    obstacle_ahead_half_angle_deg: 20.0
+    obstacle_ahead_half_angle_deg: 12.0
     # 10Hz scan：5 帧≈0.5s 确认后再上报 obstacle_ahead，降低噪点误报
     obstacle_ahead_confirm_scans: 5
     obstacle_ahead_clear_confirm_scans: 2
+    # 前方扇区内至少 N 个有效点才算障碍，过滤绕过后的孤立残点/反射（如 5~10 点簇误报）
+    obstacle_ahead_min_points: 8
+    obstacle_scan_topic: /obstacle/scan
