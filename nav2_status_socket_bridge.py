@@ -18,12 +18,17 @@ import argparse
 import asyncio
 import json
 import math
-import subprocess
+import sys
 import threading
 from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Set
+
+_AUDIO_PKG = Path(__file__).resolve().parent / 'audio'
+if str(_AUDIO_PKG) not in sys.path:
+    sys.path.insert(0, str(_AUDIO_PKG))
+from audio_player_client import AudioPlayerClient  # noqa: E402
 
 import rclpy
 import websockets
@@ -306,6 +311,9 @@ class Nav2StatusSocketBridge(Node):
         self.declare_parameter('obstacle_long_episode_play_sec', 10.0)
         self.declare_parameter('obstacle_voice_clear_grace_sec', 3.0)
         self.declare_parameter('obstacle_recovery_clear_grace_sec', 10.0)
+        self.declare_parameter('audio_server_addr', 'ipc:///tmp/audio_announcer.ipc')
+        self.declare_parameter('obstacle_voice_priority', 5)
+        self.declare_parameter('obstacle_voice_urgent', False)
         self.declare_parameter('follow_path_failed_alert_enabled', False)
         self.declare_parameter('obstacle_scan_topic', '/obstacle/scan')
         self.declare_parameter('obstacle_scan_image_enabled', True)
@@ -383,6 +391,16 @@ class Nav2StatusSocketBridge(Node):
         self._follow_path_play_count = 0
         self._follow_path_clear_since: float | None = None
         self._alert_audio_playing = False
+        self._audio_player = AudioPlayerClient(
+            addr=self.get_parameter('audio_server_addr').get_parameter_value().string_value,
+            logger=self.get_logger(),
+        )
+        self._obstacle_voice_priority = (
+            self.get_parameter('obstacle_voice_priority').get_parameter_value().integer_value
+        )
+        self._obstacle_voice_urgent = (
+            self.get_parameter('obstacle_voice_urgent').get_parameter_value().bool_value
+        )
 
         self._ws_loop: asyncio.AbstractEventLoop | None = None
         self._ws_thread: threading.Thread | None = None
@@ -641,40 +659,21 @@ class Nav2StatusSocketBridge(Node):
         return self._is_navigation_executing(msg) and msg.follow_path_failed_active
 
     def _play_alert_wav(self, wav_path: Path, label: str) -> None:
-        if not wav_path.is_file():
-            self.get_logger().warning('%s alert wav not found: %s' % (label, wav_path))
-            return
-
         with self._lock:
             if self._alert_audio_playing:
                 return
             self._alert_audio_playing = True
 
-        wav = str(wav_path)
-
         def play() -> None:
-            last_error = ''
             try:
-                for player in ('aplay', 'paplay'):
-                    try:
-                        subprocess.run(
-                            [player, '-q', wav],
-                            check=True,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                        )
-                        return
-                    except FileNotFoundError:
-                        last_error = '%s: not found in PATH' % player
-                        continue
-                    except subprocess.CalledProcessError as exc:
-                        detail = (exc.stderr or '').strip() or 'exit %d' % exc.returncode
-                        last_error = '%s failed: %s' % (player, detail)
-                        continue
-                self.get_logger().warning(
-                    'No audio player available (aplay/paplay). Last error: %s' % last_error
+                ok = self._audio_player.play_voice(
+                    wav_path,
+                    self._obstacle_voice_priority,
+                    self._obstacle_voice_urgent,
+                    wait_finish=True,
                 )
+                if not ok:
+                    self.get_logger().warning('%s alert voice playback failed' % label)
             finally:
                 with self._lock:
                     self._alert_audio_playing = False
